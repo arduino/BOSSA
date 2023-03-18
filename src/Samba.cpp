@@ -48,7 +48,6 @@ using namespace std;
 #define CAN         0x18
 #define START       'C'
 
-#define TIMEOUT_QUICK   100
 #define TIMEOUT_NORMAL  1000
 #define TIMEOUT_LONG    5000
 
@@ -75,7 +74,7 @@ Samba::init()
 {
     uint8_t cmd[3];
 
-    _port->timeout(TIMEOUT_QUICK);
+    _port->timeout(TIMEOUT_NORMAL);
 
     // Flush garbage
     uint8_t dummy[1024];
@@ -569,7 +568,7 @@ Samba::version()
     cmd[1] = '#';
     _port->write(cmd, 2);
 
-    _port->timeout(TIMEOUT_QUICK);
+    _port->timeout(TIMEOUT_NORMAL);
     size = _port->read(cmd, sizeof(cmd) - 1);
     _port->timeout(TIMEOUT_NORMAL);
     if (size <= 0)
@@ -603,7 +602,7 @@ Samba::identifyChip()
     cmd[1] = '#';
     _port->write(cmd, 2);
 
-    _port->timeout(TIMEOUT_QUICK);
+    _port->timeout(TIMEOUT_NORMAL);
     size = _port->read(cmd, sizeof(cmd) - 1);
     _port->timeout(TIMEOUT_NORMAL);
     if (size <= 0)
