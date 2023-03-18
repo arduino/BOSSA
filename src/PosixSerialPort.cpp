@@ -296,7 +296,7 @@ PosixSerialPort::put(int c)
 void
 PosixSerialPort::flush()
 {
-    fsync(_devfd);
+    tcdrain(_devfd);
 }
 
 bool
