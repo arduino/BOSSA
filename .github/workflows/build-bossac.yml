@@ -1,0 +1,133 @@
+name: Build bossac
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CROSSBUILD_IMAGE: ghcr.io/arduino/crossbuild:0.2.2
+
+jobs:
+  crossbuild:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux_amd64
+            cross: x86_64-ubuntu16.04-linux-gnu
+            os: Linux
+            cxx: x86_64-ubuntu16.04-linux-gnu-g++
+            ldflags: -static-libstdc++ -static-libgcc
+          - target: linux_386
+            cross: i686-ubuntu16.04-linux-gnu
+            os: Linux
+            cxx: i686-ubuntu16.04-linux-gnu-g++
+            ldflags: -static-libstdc++ -static-libgcc
+          - target: linux_arm
+            cross: arm-linux-gnueabihf
+            os: Linux
+            cxx: arm-linux-gnueabihf-g++
+            ldflags: -static-libstdc++ -static-libgcc
+          - target: linux_arm64
+            cross: aarch64-linux-gnu
+            os: Linux
+            cxx: aarch64-linux-gnu-g++
+            ldflags: -static-libstdc++ -static-libgcc
+          - target: windows_386
+            cross: i686-w64-mingw32
+            os: MINGW32
+            cxx: i686-w64-mingw32-g++
+            exe: .exe
+          - target: windows_amd64
+            cross: x86_64-w64-mingw32
+            os: MINGW32
+            cxx: x86_64-w64-mingw32-g++
+            exe: .exe
+          - target: darwin_amd64
+            cross: x86_64-apple-darwin13
+            os: Darwin
+            cxx: o64-clang++
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        run: echo "VERSION=$(git describe --tags --dirty --always)" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          # Keep the committed applet source so arm-none-eabi-as is not needed
+          touch src/WordCopyArm.cpp
+          docker run --rm \
+            -v "$PWD":/workdir -w /workdir \
+            -e CROSS_COMPILE=${{ matrix.cross }} \
+            --entrypoint /bin/bash \
+            "$CROSSBUILD_IMAGE" -c '
+              make bossac Q= \
+                OS="${{ matrix.os }}" \
+                CXX="${{ matrix.cxx }}" \
+                LDFLAGS="${{ matrix.ldflags }}" \
+                VERSION="${{ env.VERSION }}" &&
+              ${{ matrix.cross }}-strip bin/bossac${{ matrix.exe }}
+            '
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/bossac-${{ env.VERSION }}-${{ matrix.target }}.tar.gz -C bin bossac${{ matrix.exe }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bossac-${{ matrix.target }}
+          path: dist/*
+
+  # The crossbuild image's macOS SDK predates Apple Silicon, so build arm64 natively
+  darwin-arm64:
+    name: darwin_arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        run: echo "VERSION=$(git describe --tags --dirty --always)" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          touch src/WordCopyArm.cpp
+          make bossac Q= OS=Darwin MACOS_ARCH=arm64 CXX=clang++ CXXFLAGS=-Wno-error VERSION="$VERSION"
+          strip bin/bossac
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/bossac-$VERSION-darwin_arm64.tar.gz -C bin bossac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bossac-darwin_arm64
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [crossbuild, darwin-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
