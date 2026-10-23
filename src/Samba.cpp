@@ -165,11 +165,18 @@ Samba::connect(SerialPort::Ptr port, int bps)
     _isUsb = false;
 
     // Try the serial port at slower speed
-    if (_port->open(bps) && init())
+    if (_port->open(bps))
     {
-        if (_debug)
-            printf("Connected at %d baud\n", bps);
-        return true;
+        // The RS-232 auto-baud sequence may need a few tries right after a reset
+        for (int i = 0; i < 3; i++)
+        {
+            if (init())
+            {
+                if (_debug)
+                    printf("Connected at %d baud\n", bps);
+                return true;
+            }
+        }
     }
 
     disconnect();
