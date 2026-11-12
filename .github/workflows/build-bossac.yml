@@ -2,7 +2,7 @@ name: Build bossac
 
 on:
   push:
-    branches: [master, main]
+    branches: [nrf]
     tags: ['*']
   pull_request:
   workflow_dispatch:
@@ -65,9 +65,39 @@ jobs:
           name: bossac-osxarm64
           path: dist/*
 
+  test:
+    name: Test (${{ matrix.target }})
+    needs: [crossbuild, osxarm64]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux64,      runner: ubuntu-24.04 }
+          - { target: linuxaarch64, runner: ubuntu-24.04-arm }
+          - { target: osx,          runner: macos-latest, rosetta: true }
+          - { target: osxarm64,     runner: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Install Rosetta
+        if: matrix.rosetta
+        run: softwareupdate --install-rosetta --agree-to-license
+
+      - name: Extract
+        run: tar -xzf dist/bossac-*-${{ matrix.target }}.tar.gz
+
+      - name: Run tests
+        run: python3 -I tests/run.py --bossac bin/bossac
+
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [crossbuild, osxarm64]
+    needs: [crossbuild, osxarm64, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
