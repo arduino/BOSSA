@@ -10,3 +10,4 @@ tags
 *.bak
 install/*.crt
 install/*.p12
+__pycache__/
