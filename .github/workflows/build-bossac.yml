@@ -1,110 +1,269 @@
-name: Build bossac
+name: 'Build bossac'
 
 on:
-  push:
-    branches: [nrf]
-    tags: ['*']
-  pull_request:
   workflow_dispatch:
 
+  push:
+    branches:
+      - 'nrf'
+    tags:
+      - '*'
+
+  pull_request:
+    branches:
+      - 'nrf'
+
 permissions:
-  contents: write
+  contents: read
 
 env:
-  CROSSBUILD_IMAGE: ghcr.io/arduino/crossbuild:0.2.2
+  LLVM_MINGW_VERSION: '20261020'
+  LLVM_MINGW_SHA256: 55064b60b991a1e1e8090b8c2f84e82b22cfe5903d12c159d65064cf5e8ae335
+  AWS_REGION: us-east-1
+  AWS_PLUGIN_TARGET: /tools/bossac/
+  DIST_DIR: artifacts
 
 jobs:
-  crossbuild:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Determine version
-        run: echo "VERSION=$(git describe --tags --dirty --always)" >> "$GITHUB_ENV"
-
-      - name: Build
-        run: |
-          docker run --rm \
-            -v "$PWD":/workdir -w /workdir \
-            -e VERSION \
-            --entrypoint /bin/bash \
-            "$CROSSBUILD_IMAGE" .github/scripts/crossbuild-bossac.sh
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bossac-crossbuild
-          path: dist/*
-
-  # The crossbuild image's macOS SDK predates Apple Silicon, so build arm64 natively
-  osxarm64:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Determine version
-        run: echo "VERSION=$(git describe --tags --dirty --always)" >> "$GITHUB_ENV"
-
-      - name: Build
-        run: |
-          touch src/WordCopyArm.cpp
-          make bossac Q= OS=Darwin MACOS_ARCH=arm64 CXX=clang++ CXXFLAGS=-Wno-error VERSION="$VERSION"
-          strip bin/bossac
-
-      - name: Package
-        run: |
-          mkdir -p dist stage/bin
-          cp bin/bossac stage/bin/
-          tar -czf dist/bossac-$VERSION-osxarm64.tar.gz -C stage bin
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bossac-osxarm64
-          path: dist/*
-
-  test:
-    name: Test (${{ matrix.target }})
-    needs: [crossbuild, osxarm64]
+  build-bossac:
+    name: 'Build (${{ matrix.os }}_${{ matrix.arch }})'
     runs-on: ${{ matrix.runner }}
+
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: linux64,      runner: ubuntu-24.04 }
-          - { target: linuxaarch64, runner: ubuntu-24.04-arm }
-          - { target: osx,          runner: macos-latest, rosetta: true }
-          - { target: osxarm64,     runner: macos-latest }
+          - { os: linux,   arch: amd64, runner: ubuntu-24.04, host: '' }
+          - { os: linux,   arch: '386', runner: ubuntu-24.04, host: i686-linux-gnu,      apt: g++-i686-linux-gnu }
+          - { os: linux,   arch: arm,   runner: ubuntu-24.04, host: arm-linux-gnueabihf, apt: g++-arm-linux-gnueabihf }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04, host: aarch64-linux-gnu,   apt: g++-aarch64-linux-gnu }
+          - { os: darwin,  arch: amd64, runner: macos-latest, macho: x86_64 }
+          - { os: darwin,  arch: arm64, runner: macos-latest, macho: arm64 }
+          - { os: windows, arch: '386', runner: ubuntu-24.04, host: i686-w64-mingw32 }
+          - { os: windows, arch: amd64, runner: ubuntu-24.04, host: x86_64-w64-mingw32 }
+          - { os: windows, arch: arm64, runner: ubuntu-24.04, host: aarch64-w64-mingw32 }
+
+    env:
+      HOST: ${{ matrix.host }}
+      TARGET: ${{ matrix.os }}_${{ matrix.arch }}
+
+    defaults:
+      run:
+        shell: bash
+
     steps:
-      - uses: actions/checkout@v4
+    - name: 'Checkout'
+      uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
+    - name: 'Install deps (Ubuntu)'
+      if: matrix.os == 'linux' && matrix.apt
+      run: |
+        sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true # unreliable mirror
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.apt }}
 
-      - name: Install Rosetta
-        if: matrix.rosetta
-        run: softwareupdate --install-rosetta --agree-to-license
+    - name: 'Install llvm-mingw'
+      if: matrix.os == 'windows'
+      run: |
+        NAME="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64"
+        curl -fsSL -o "${NAME}.tar.xz" \
+          "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${NAME}.tar.xz"
+        echo "${LLVM_MINGW_SHA256}  ${NAME}.tar.xz" | sha256sum -c -
+        tar xf "${NAME}.tar.xz" -C "${RUNNER_TEMP}"
+        echo "${RUNNER_TEMP}/${NAME}/bin" >> "$GITHUB_PATH"
 
-      - name: Extract
-        run: tar -xzf dist/bossac-*-${{ matrix.target }}.tar.gz
+    - name: 'Set version'
+      run: |
+        if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          echo "PROJECT_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+        else
+          echo "PROJECT_VERSION=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+        fi
 
-      - name: Run tests
-        run: python3 -I tests/run.py --bossac bin/bossac
+    - name: 'Build bossac'
+      run: |
+        NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+        case "${{ matrix.os }}" in
+          linux)
+            MAKE_ARGS=(OS=Linux CXX="${HOST:+${HOST}-}g++" LDFLAGS="-static")
+            STRIP="${HOST:+${HOST}-}strip"
+            EXE=""
+            ;;
+          darwin)
+            MAKE_ARGS=(OS=Darwin MACOS_ARCH=${{ matrix.macho }} CXX=clang++)
+            STRIP="strip"
+            EXE=""
+            ;;
+          windows)
+            MAKE_ARGS=(OS=MINGW32 CXX="${HOST}-clang++")
+            STRIP="${HOST}-strip"
+            EXE=".exe"
+            ;;
+        esac
 
-  release:
+        # The committed applet source is used, so arm-none-eabi-as is not needed.
+        touch src/WordCopyArm.cpp
+        make -j"${NPROC}" bossac Q= "${MAKE_ARGS[@]}" CXXFLAGS=-Wno-error VERSION="${PROJECT_VERSION}"
+
+        mkdir -p "${TARGET}"
+        cp "bin/bossac${EXE}" "${TARGET}/"
+        "${STRIP}" "${TARGET}/bossac${EXE}"
+
+    - name: 'Check binary'
+      run: |
+        f=$(ls "${TARGET}"/bossac*)
+        if ! grep -aq "${PROJECT_VERSION}" "${f}"; then
+          echo "Error: ${f} does not contain version ${PROJECT_VERSION}"
+          exit 1
+        fi
+        case "${{ matrix.os }}" in
+          linux)
+            file "${f}"
+            file "${f}" | grep -Eq 'statically linked|static-pie linked'
+            ;;
+          windows)
+            llvm-objdump -f "${f}"
+            llvm-objdump -p "${f}" | grep 'DLL Name'
+            if llvm-objdump -p "${f}" | grep -iE 'DLL Name: (libwinpthread|libgcc|libc\+\+|libunwind)'; then
+              echo "Error: ${f} depends on a non-system DLL"
+              exit 1
+            fi
+            ;;
+          darwin)
+            otool -L "${f}"
+            if otool -L "${f}" | tail -n +2 | grep -vE '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
+              echo "Error: ${f} links a non-system library"
+              exit 1
+            fi
+            vtool -show-build "${f}"
+            test "$(lipo -archs "${f}")" = "${{ matrix.macho }}"
+            ;;
+        esac
+
+    - name: 'Sign binary (macOS)'
+      if: matrix.os == 'darwin'
+      run: |
+        codesign --force --sign - "${TARGET}/bossac"
+        codesign --verify --strict --verbose "${TARGET}/bossac"
+
+    - name: 'Package'
+      run: |
+        chmod +x "${TARGET}"/*
+        tar czf "bossac-${PROJECT_VERSION}-${TARGET}.tar.gz" "${TARGET}"
+
+    - name: 'Upload artifact'
+      uses: actions/upload-artifact@v4
+      with:
+        name: bossac-${{ env.TARGET }}
+        path: bossac-${{ env.PROJECT_VERSION }}-${{ env.TARGET }}.tar.gz
+        retention-days: 1
+        if-no-files-found: error
+
+  test-bossac:
+    name: 'Test (${{ matrix.target }} on ${{ matrix.runner }})'
+    needs: [build-bossac]
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux_amd64,   runner: ubuntu-24.04 }
+          - { target: linux_386,     runner: ubuntu-24.04 }
+          - { target: linux_arm,     runner: ubuntu-24.04, qemu: true }
+          - { target: linux_arm64,   runner: ubuntu-24.04-arm }
+          - { target: darwin_amd64,  runner: macos-latest, rosetta: true }
+          - { target: darwin_arm64,  runner: macos-latest }
+          # The emulator needs a pty, so on Windows only check that bossac
+          # starts, and how long it takes. windows_amd64 on windows-11-arm is
+          # an x64 build running under emulation on Windows on ARM.
+          - { target: windows_386,   runner: windows-latest, exe: .exe }
+          - { target: windows_amd64, runner: windows-latest, exe: .exe }
+          - { target: windows_amd64, runner: windows-11-arm, exe: .exe }
+          - { target: windows_arm64, runner: windows-11-arm, exe: .exe }
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: 'Checkout'
+      uses: actions/checkout@v4
+
+    - name: 'Install qemu-user'
+      if: matrix.qemu
+      run: |
+        sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true # unreliable mirror
+        sudo apt-get update
+        sudo apt-get install -y qemu-user-static
+
+    - name: 'Install Rosetta'
+      if: matrix.rosetta
+      run: softwareupdate --install-rosetta --agree-to-license
+
+    - name: 'Download artifact'
+      uses: actions/download-artifact@v4
+      with:
+        name: bossac-${{ matrix.target }}
+
+    - name: 'Extract'
+      run: tar xzf bossac-*-${{ matrix.target }}.tar.gz
+
+    - name: 'Run tests'
+      if: ${{ !matrix.exe }}
+      run: python3 -I tests/run.py --bossac "${{ matrix.target }}/bossac"
+
+    - name: 'Check startup time'
+      if: ${{ matrix.exe }}
+      run: |
+        f="${{ matrix.target }}/bossac.exe"
+        # The first run may include one-time costs (x64 translation cache, Defender scan).
+        for i in 1 2 3; do
+          start=$(date +%s%N)
+          "${f}" --version
+          ms=$(( ($(date +%s%N) - start) / 1000000 ))
+          echo "run ${i}: ${ms} ms"
+        done
+        if [ "${ms}" -gt 2000 ]; then
+          echo "Error: bossac --version took ${ms} ms"
+          exit 1
+        fi
+
+  create-release:
+    runs-on: ubuntu-24.04
+    needs: [build-bossac, test-bossac]
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [crossbuild, osxarm64, test]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
+    environment: production
+    permissions:
+      contents: write
+      id-token: write
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+    steps:
+    - name: 'Download artifacts'
+      uses: actions/download-artifact@v4
+      with:
+        path: ${{ env.DIST_DIR }}/
+        pattern: 'bossac-*'
+        merge-multiple: true
+
+    - name: 'Create release'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        PROJECT_VERSION="${GITHUB_REF_NAME}"
+        cd "${DIST_DIR}"
+        sha256sum bossac-*.tar.gz > "bossac-${PROJECT_VERSION}.sha256"
+        cat "bossac-${PROJECT_VERSION}.sha256"
+        gh release create "${GITHUB_REF_NAME}" \
+          --title "bossac ${PROJECT_VERSION}" \
+          --notes "Built from commit ${GITHUB_SHA}." \
+          ./*
+
+    - name: 'Configure AWS credentials'
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: 'Upload to downloads.arduino.cc'
+      run: aws s3 sync "${DIST_DIR}" "s3://${{ secrets.DOWNLOADS_BUCKET }}${AWS_PLUGIN_TARGET}"
